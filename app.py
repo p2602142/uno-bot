@@ -8,7 +8,7 @@ import os
 
 app = Flask(__name__)
 
-# ดึงค่า Key จาก Environment Variable บน Render
+# ดึงค่า Token จาก Environment Variables บน Render
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 
@@ -20,6 +20,9 @@ cred = credentials.Certificate('serviceAccountKey.json')
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
 def to_mins(hhmm):
     if not hhmm: return None
     m = re.match(r"^(\d{1,2}):(\d{2})$", hhmm.strip())
@@ -37,14 +40,22 @@ def parse_thai_date(date_str):
 
 def parse_shift_text(raw_text):
     text = raw_text.strip()
-    if re.search(r"^off$|^หยุด$", text, re.IGNORECASE):
-        return {"status": "off", "timeIn": None, "timeOut": None}
+    
+    # 1. เช็กกรณี ลาป่วย / หยุด / off
     if re.search(r"ป่วย|ลาป่วย", text):
         return {"status": "sick", "timeIn": None, "timeOut": None}
+    if re.search(r"^off$|^หยุด$", text, re.IGNORECASE):
+        return {"status": "off", "timeIn": None, "timeOut": None}
     
+    # 2. ดึงเวลา HH:MM - HH:MM (ข้ามพวกข้อความต่อท้าย เช่น ot 0.11)
     range_match = re.search(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", text)
     if range_match:
-        return {"status": "work", "timeIn": range_match.group(1), "timeOut": range_match.group(2)}
+        return {
+            "status": "work", 
+            "timeIn": range_match.group(1), 
+            "timeOut": range_match.group(2)
+        }
+        
     return {"status": "work", "timeIn": None, "timeOut": None}
 
 def match_nearest_shift(shifts, in_min):
@@ -90,11 +101,14 @@ def process_report_text(text, shifts):
 
     for line in lines:
         b_match = re.search(r"สาขา\s*([A-Za-zก-๙0-9_-]+)", line)
-        if b_match: branch = b_match.group(1).strip()
-        
+        if b_match: 
+            branch = b_match.group(1).strip()
+            
         d_match = re.search(r"วันที่\s*(\d{1,2}\/\d{1,2}\/\d{2,4})", line)
-        if d_match: ymd = parse_thai_date(d_match.group(1))
+        if d_match: 
+            ymd = parse_thai_date(d_match.group(1))
 
+        # ดักจับแพทเทิร์นรายการ (รองรับ Space หลายช่อง)
         r_match = re.search(r"^\d+[.)]\s*(\d{4,})\s+(\S+)\s+(.*)$", line)
         if r_match:
             code, name, rest = r_match.groups()
@@ -105,6 +119,9 @@ def process_report_text(text, shifts):
 
     return branch, ymd, rows
 
+# ==========================================
+# WEBHOOK CONTROLLER
+# ==========================================
 @app.route("/webhook", methods=['POST'])
 def webhook():
     body = request.get_data(as_text=True)
@@ -119,9 +136,11 @@ def webhook():
 def handle_message(event):
     user_text = event.message.text
 
+    # กรองเฉพาะข้อความที่มี สาขา และ วันที่
     if "สาขา" not in user_text or "วันที่" not in user_text:
         return
 
+    # ดึงข้อมูล Master shifts จาก Firestore
     doc_ref = db.collection("ot_system").document("app_data")
     doc = doc_ref.get()
     if not doc.exists:
@@ -130,6 +149,7 @@ def handle_message(event):
     cloud_data = doc.to_dict()
     shifts = cloud_data.get("shifts", [])
 
+    # ประมวลผลข้อความ
     branch, ymd, rows = process_report_text(user_text, shifts)
 
     if not branch or not ymd or not rows:
@@ -137,6 +157,7 @@ def handle_message(event):
         line_bot_api.reply_message(event.replyToken, TextSendMessage(text=reply_msg))
         return
 
+    # เตรียม Data Structure สำหรับอัปเดตลง Firebase
     record_key = f"{branch}|{ymd}"
     next_records = cloud_data.get("records", {})
     next_records[record_key] = rows
@@ -154,12 +175,14 @@ def handle_message(event):
                 "name": r['name']
             }
 
+    # บันทึกขึ้น Firestore
     doc_ref.update({
         "records": next_records,
         "employees": next_emps,
         "users": next_users
     })
 
+    # ตอบกลับ LINE
     reply_msg = f"✅ บันทึกข้อมูลเรียบร้อย!\nสาขา: {branch}\nวันที่: {ymd}\nจำนวน: {len(rows)} คน"
     line_bot_api.reply_message(event.replyToken, TextSendMessage(text=reply_msg))
 
