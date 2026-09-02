@@ -24,17 +24,18 @@ db = None
 def init_firebase():
     global db
     if not firebase_admin._apps:
-        creds_json = os.environ.get("FIREBASE_CREDENTIALS")
+        # FIX จุดที่ 1: เปลี่ยนจาก FIREBASE_CREDENTIALS เป็น FIREBASE_SERVICE_ACCOUNT ให้ตรงกับ Render
+        creds_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
         if creds_json:
             try:
-                # แปลง JSON String และจัดการ Newline (\n) ใน Private Key ป้องกัน Timeout
                 cred_dict = json.loads(creds_json, strict=False)
                 if "private_key" in cred_dict:
                     cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
                 cred = credentials.Certificate(cred_dict)
                 firebase_admin.initialize_app(cred)
+                print("Firebase Initialized Successfully via Env")
             except Exception as e:
-                print(f"Error parsing FIREBASE_CREDENTIALS: {e}")
+                print(f"Error parsing FIREBASE_SERVICE_ACCOUNT: {e}")
         elif os.path.exists("serviceAccountKey.json"):
             cred = credentials.Certificate("serviceAccountKey.json")
             firebase_admin.initialize_app(cred)
@@ -42,25 +43,21 @@ def init_firebase():
     if firebase_admin._apps and not db:
         db = firestore.client()
 
-# เรียกใช้งานการเชื่อมต่อ Firebase
 init_firebase()
 
 # ==========================================
 # 2. Helper Functions & Parsing Logic
 # ==========================================
 def to_mins(hhmm):
-    """แปลงเวลา string (HH:MM) เป็นนาที"""
     if not hhmm:
         return None
     match = re.search(r"^(\d{1,2}):(\d{2})$", str(hhmm).strip())
     return int(match.group(1)) * 60 + int(match.group(2)) if match else None
 
 def mins_to_hours(mins):
-    """แปลงนาทีเป็นชั่วโมง"""
     return round((mins / 60.0), 2)
 
 def parse_thai_date(date_str):
-    """แปลง วันที่ DD/MM/YY หรือ DD/MM/YYYY ให้เป็น YYYY-MM-DD"""
     match = re.search(r"(\d{1,2})\/(\d{1,2})\/(\d{2,4})", date_str)
     if not match:
         return None
@@ -70,7 +67,6 @@ def parse_thai_date(date_str):
     return f"{y}-{mo:02d}-{d:02d}"
 
 def match_nearest_shift(shifts, in_min):
-    """หากะการทำงานที่ใกล้เคียงที่สุดจากเวลาเข้างาน"""
     if in_min is None or not shifts:
         return None
     selected = None
@@ -86,15 +82,11 @@ def match_nearest_shift(shifts, in_min):
     return selected
 
 def parse_shift_text(raw_text):
-    """แกะสถานะการทำงานและเวลาเข้า-ออก (รองรับกรณีลาป่วย/เวลาไม่สมบูรณ์)"""
     text = raw_text.strip()
-
-    # ดึงช่วงเวลา (HH:MM - HH:MM)
     range_match = re.search(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", text)
     time_in = range_match.group(1) if range_match else None
     time_out = range_match.group(2) if range_match else None
 
-    # ตรวจสอบสถานะการทำงาน
     if re.search(r"ป่วย|ลาป่วย", text, re.IGNORECASE):
         status = "sick"
     elif re.search(r"^off$|^หยุด$", text, re.IGNORECASE):
@@ -107,7 +99,6 @@ def parse_shift_text(raw_text):
     return {"status": status, "timeIn": time_in, "timeOut": time_out}
 
 def calculate_ot(row, shifts):
-    """คำนวณชั่วโมงปกติและชั่วโมง OT"""
     if row.get("status") != "work":
         return {"normalHours": 0, "otHours": 0}
 
@@ -134,7 +125,6 @@ def calculate_ot(row, shifts):
     }
 
 def process_report_text(text, shifts):
-    """อ่านข้อความรายงานประจำวันแล้วแปลงเป็น Data Object"""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     branch = ""
     ymd = None
@@ -149,7 +139,6 @@ def process_report_text(text, shifts):
         if d_match:
             ymd = parse_thai_date(d_match.group(1))
 
-        # ดักจับรายชื่อพนักงานและเวลา
         r_match = re.search(r"^\d+[.)]\s*(\d{4,})\s+(.+?)\s+([0-9: \-a-zA-Zก-๙]+.*)$", line)
         if r_match:
             code = r_match.group(1)
@@ -193,24 +182,35 @@ def webhook():
 def handle_message(event):
     user_text = event.message.text
 
+    # FIX จุดที่ 2: ตอบกลับเตือนผู้ใช้ถ้าข้อความไม่มีคำว่า สาขา หรือ วันที่
     if "สาขา" not in user_text or "วันที่" not in user_text:
+        line_bot_api.reply_message(
+            event.reply_token, 
+            TextSendMessage(text="⚠️ กรุณาส่งข้อความตามรูปแบบที่มีคำว่า 'สาขา' และ 'วันที่' ด้วยครับ")
+        )
         return
 
     if not db:
         print("Database not connected")
+        line_bot_api.reply_message(
+            event.reply_token, 
+            TextSendMessage(text="❌ ระบบขัดข้อง: ไม่สามารถเชื่อมต่อ Database ได้")
+        )
         return
 
     try:
-        # 1. ดึง Master Data จาก Firestore
+        # FIX จุดที่ 3: ดึงข้อมูล หรือสร้างใหม่หากยังไม่มี Document
         doc_ref = db.collection("ot_system").document("app_data")
         doc = doc_ref.get()
-        if not doc.exists:
-            return
+        
+        if doc.exists:
+            cloud_data = doc.to_dict()
+        else:
+            cloud_data = {"shifts": [], "records": {}, "employees": {}, "users": {}}
 
-        cloud_data = doc.to_dict()
         shifts = cloud_data.get("shifts", [])
 
-        # 2. ประมวลผลข้อความ
+        # ประมวลผลข้อความ
         branch, ymd, rows = process_report_text(user_text, shifts)
 
         if not branch or not ymd or not rows:
@@ -218,7 +218,6 @@ def handle_message(event):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
             return
 
-        # 3. จัดเตรียมโครงสร้างบันทึกข้อมูลเข้า Firestore ให้ตรงกับ index.html
         record_key = f"{branch}|{ymd}"
         next_records = cloud_data.get("records", {})
         next_records[record_key] = rows
@@ -236,19 +235,22 @@ def handle_message(event):
                     "name": r["name"]
                 }
 
-        # 4. บันทึกกลับไปยัง Document เดียวกัน
-        doc_ref.update({
+        # บันทึกข้อมูลลง Firestore (ใช้ set ร่วมกับ merge=True เพื่อความปลอดภัย)
+        doc_ref.set({
             "records": next_records,
             "employees": next_emps,
             "users": next_users
-        })
+        }, merge=True)
 
-        # 5. แจ้งเตือนกลับไปยัง LINE
         reply_msg = f"✅ บันทึกข้อมูลเรียบร้อย!\nสาขา: {branch}\nวันที่: {ymd}\nจำนวน: {len(rows)} คน"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
 
     except Exception as e:
         print(f"Error handling LINE message: {e}")
+        line_bot_api.reply_message(
+            event.reply_token, 
+            TextSendMessage(text=f"❌ เกิดข้อผิดพลาดในระบบ: {str(e)}")
+        )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
