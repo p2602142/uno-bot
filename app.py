@@ -9,16 +9,23 @@ import os
 app = Flask(__name__)
 
 # ดึงค่า Token จาก Environment Variables บน Render
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
-LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
+LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '')
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# เชื่อมต่อ Firebase Firestore
-cred = credentials.Certificate('serviceAccountKey.json')
-firebase_admin.initialize_app(cred)
-db = firestore.client()
+# ตัวแปรเก็บ Firestore DB (สร้างเมื่อมีการเรียกใช้เท่านั้น เพื่อป้องกัน Timeout ตอน Startup)
+db_instance = None
+
+def get_db():
+    global db_instance
+    if db_instance is None:
+        if not firebase_admin._apps:
+            cred = credentials.Certificate('serviceAccountKey.json')
+            firebase_admin.initialize_app(cred)
+        db_instance = firestore.client()
+    return db_instance
 
 # ==========================================
 # HELPER FUNCTIONS
@@ -122,6 +129,10 @@ def process_report_text(text, shifts):
 # ==========================================
 # WEBHOOK CONTROLLER
 # ==========================================
+@app.route("/", methods=['GET'])
+def index():
+    return "Bot status: OK", 200
+
 @app.route("/webhook", methods=['POST'])
 def webhook():
     body = request.get_data(as_text=True)
@@ -139,6 +150,9 @@ def handle_message(event):
     # กรองเฉพาะข้อความที่มี สาขา และ วันที่
     if "สาขา" not in user_text or "วันที่" not in user_text:
         return
+
+    # ดึง DB Instance แบบ Lazy Load
+    db = get_db()
 
     # ดึงข้อมูล Master shifts จาก Firestore
     doc_ref = db.collection("ot_system").document("app_data")
