@@ -11,28 +11,42 @@ from firebase_admin import credentials, firestore
 app = Flask(__name__)
 
 # ==========================================
-# 1. Configuration & Firebase Initialization
+# 1. Configuration & Safe Firebase Initializer
 # ==========================================
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# เชื่อมต่อ Firebase (รองรับทั้งการอ่าน Environment Variable บน Render และไฟล์ Local)
-firebase_creds_json = os.environ.get("FIREBASE_CREDENTIALS")
-if firebase_creds_json:
-    cred_dict = json.loads(firebase_creds_json)
-    cred = credentials.Certificate(cred_dict)
-    firebase_admin.initialize_app(cred)
-elif os.path.exists("serviceAccountKey.json"):
-    cred = credentials.Certificate("serviceAccountKey.json")
-    firebase_admin.initialize_app(cred)
+db = None
 
-db = firestore.client() if firebase_admin._apps else None
+def init_firebase():
+    global db
+    if not firebase_admin._apps:
+        creds_json = os.environ.get("FIREBASE_CREDENTIALS")
+        if creds_json:
+            try:
+                # แปลง JSON String และจัดการ Newline (\n) ใน Private Key ป้องกัน Timeout
+                cred_dict = json.loads(creds_json, strict=False)
+                if "private_key" in cred_dict:
+                    cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
+                cred = credentials.Certificate(cred_dict)
+                firebase_admin.initialize_app(cred)
+            except Exception as e:
+                print(f"Error parsing FIREBASE_CREDENTIALS: {e}")
+        elif os.path.exists("serviceAccountKey.json"):
+            cred = credentials.Certificate("serviceAccountKey.json")
+            firebase_admin.initialize_app(cred)
+            
+    if firebase_admin._apps and not db:
+        db = firestore.client()
+
+# เรียกใช้งานการเชื่อมต่อ Firebase
+init_firebase()
 
 # ==========================================
-# 2. Helper Functions (พอร์ต Logic จาก index.html)
+# 2. Helper Functions & Parsing Logic
 # ==========================================
 def to_mins(hhmm):
     """แปลงเวลา string (HH:MM) เป็นนาที"""
@@ -72,7 +86,7 @@ def match_nearest_shift(shifts, in_min):
     return selected
 
 def parse_shift_text(raw_text):
-    """แกะสถานะการทำงานและเวลาเข้า-ออก"""
+    """แกะสถานะการทำงานและเวลาเข้า-ออก (รองรับกรณีลาป่วย/เวลาไม่สมบูรณ์)"""
     text = raw_text.strip()
 
     # ดึงช่วงเวลา (HH:MM - HH:MM)
@@ -120,7 +134,7 @@ def calculate_ot(row, shifts):
     }
 
 def process_report_text(text, shifts):
-    """อ่านข้อความรายงานแล้วแปลงเป็น Data Object"""
+    """อ่านข้อความรายงานประจำวันแล้วแปลงเป็น Data Object"""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     branch = ""
     ymd = None
@@ -135,7 +149,7 @@ def process_report_text(text, shifts):
         if d_match:
             ymd = parse_thai_date(d_match.group(1))
 
-        # ดักจับแพทเทิร์นรายการ (เช่น 1. 200190 อาม 11:30 - 22:11 ot 0.11)
+        # ดักจับรายชื่อพนักงานและเวลา
         r_match = re.search(r"^\d+[.)]\s*(\d{4,})\s+(.+?)\s+([0-9: \-a-zA-Zก-๙]+.*)$", line)
         if r_match:
             code = r_match.group(1)
@@ -150,14 +164,14 @@ def process_report_text(text, shifts):
     return branch, ymd, rows
 
 # ==========================================
-# 3. Webhook & API Routes
+# 3. Webhook & Web Routes
 # ==========================================
 @app.route("/")
 def index():
     return jsonify({
         "status": "Online",
         "service": "UNO OT Bot",
-        "database": "Firestore Connected" if db else "Firestore Missing"
+        "database": "Firestore Connected" if db else "Firestore Connection Failed"
     })
 
 @app.route("/webhook", methods=["POST"])
@@ -169,64 +183,72 @@ def webhook():
         handler.handle(body, signature)
     except InvalidSignatureError:
         return "Invalid signature", 400
+    except Exception as e:
+        print(f"Webhook Error: {e}")
+        return "Internal Error", 500
+        
     return "OK", 200
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_text = event.message.text
 
-    # กรองเบื้องต้นว่ามีคำว่า "สาขา" และ "วันที่" หรือไม่
     if "สาขา" not in user_text or "วันที่" not in user_text:
         return
 
     if not db:
+        print("Database not connected")
         return
 
-    # 1. ดึงข้อมูล Master Data ล่าสุดจาก Firestore
-    doc_ref = db.collection("ot_system").document("app_data")
-    doc = doc_ref.get()
-    if not doc.exists:
-        return
+    try:
+        # 1. ดึง Master Data จาก Firestore
+        doc_ref = db.collection("ot_system").document("app_data")
+        doc = doc_ref.get()
+        if not doc.exists:
+            return
 
-    cloud_data = doc.to_dict()
-    shifts = cloud_data.get("shifts", [])
+        cloud_data = doc.to_dict()
+        shifts = cloud_data.get("shifts", [])
 
-    # 2. ประมวลผลข้อความ
-    branch, ymd, rows = process_report_text(user_text, shifts)
+        # 2. ประมวลผลข้อความ
+        branch, ymd, rows = process_report_text(user_text, shifts)
 
-    if not branch or not ymd or not rows:
-        reply_msg = "❌ ไม่สามารถประมวลผลได้ กรุณาตรวจสอบรูปแบบข้อความ (ต้องมี สาขา, วันที่ และรายชื่อ)"
-        line_bot_api.reply_message(event.replyToken, TextSendMessage(text=reply_msg))
-        return
+        if not branch or not ymd or not rows:
+            reply_msg = "❌ ไม่สามารถประมวลผลได้ กรุณาตรวจสอบรูปแบบข้อความ (ต้องระบุ สาขา, วันที่ และรายชื่อ)"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
+            return
 
-    # 3. เตรียมข้อมูลบันทึกลง Firestore (ให้โครงสร้างตรงกับหน้าเว็บ index.html)
-    record_key = f"{branch}|{ymd}"
-    next_records = cloud_data.get("records", {})
-    next_records[record_key] = rows
+        # 3. จัดเตรียมโครงสร้างบันทึกข้อมูลเข้า Firestore ให้ตรงกับ index.html
+        record_key = f"{branch}|{ymd}"
+        next_records = cloud_data.get("records", {})
+        next_records[record_key] = rows
 
-    next_emps = cloud_data.get("employees", {})
-    next_users = cloud_data.get("users", {})
+        next_emps = cloud_data.get("employees", {})
+        next_users = cloud_data.get("users", {})
 
-    for r in rows:
-        next_emps[r["code"]] = {"code": r["code"], "name": r["name"]}
-        if r["code"] not in next_users:
-            next_users[r["code"]] = {
-                "code": r["code"],
-                "pass": "1234",
-                "role": "employee",
-                "name": r["name"]
-            }
+        for r in rows:
+            next_emps[r["code"]] = {"code": r["code"], "name": r["name"]}
+            if r["code"] not in next_users:
+                next_users[r["code"]] = {
+                    "code": r["code"],
+                    "pass": "1234",
+                    "role": "employee",
+                    "name": r["name"]
+                }
 
-    # 4. อัปเดตกลับไปยัง Firestore
-    doc_ref.update({
-        "records": next_records,
-        "employees": next_emps,
-        "users": next_users
-    })
+        # 4. บันทึกกลับไปยัง Document เดียวกัน
+        doc_ref.update({
+            "records": next_records,
+            "employees": next_emps,
+            "users": next_users
+        })
 
-    # 5. สรุปผลและส่งข้อความตอบกลับเข้า LINE
-    reply_msg = f"✅ บันทึกข้อมูลเรียบร้อย!\nสาขา: {branch}\nวันที่: {ymd}\nจำนวน: {len(rows)} คน"
-    line_bot_api.reply_message(event.replyToken, TextSendMessage(text=reply_msg))
+        # 5. แจ้งเตือนกลับไปยัง LINE
+        reply_msg = f"✅ บันทึกข้อมูลเรียบร้อย!\nสาขา: {branch}\nวันที่: {ymd}\nจำนวน: {len(rows)} คน"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
+
+    except Exception as e:
+        print(f"Error handling LINE message: {e}")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
