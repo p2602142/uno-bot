@@ -1,28 +1,38 @@
 from flask import Flask, request
-from linebot import LineBotApi, WebhookHandler
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.v3 import WebhookHandler
+from linebot.v3.messaging import (
+    Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage
+)
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import firebase_admin
 from firebase_admin import credentials, firestore
 import re
 import os
+import json
 
 app = Flask(__name__)
 
-# ดึงค่า Token จาก Environment Variables บน Render
+# ดึง Token จาก Environment Variables บน Render
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '')
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# ตัวแปรเก็บ Firestore DB (สร้างเมื่อมีการเรียกใช้เท่านั้น เพื่อป้องกัน Timeout ตอน Startup)
+# Lazy Load Firebase DB (ใช้ Firebase Credentials จาก Env Var)
 db_instance = None
 
 def get_db():
     global db_instance
     if db_instance is None:
         if not firebase_admin._apps:
-            cred = credentials.Certificate('serviceAccountKey.json')
+            # ดึงข้อมูลจาก Env Var สตริง JSON (ถ้าไม่มีค่อยถอยไปอ่านไฟล์)
+            service_account_env = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
+            if service_account_env:
+                cred_dict = json.loads(service_account_env)
+                cred = credentials.Certificate(cred_dict)
+            else:
+                cred = credentials.Certificate('serviceAccountKey.json')
             firebase_admin.initialize_app(cred)
         db_instance = firestore.client()
     return db_instance
@@ -47,21 +57,14 @@ def parse_thai_date(date_str):
 
 def parse_shift_text(raw_text):
     text = raw_text.strip()
-    
-    # 1. เช็กกรณี ลาป่วย / หยุด / off
     if re.search(r"ป่วย|ลาป่วย", text):
         return {"status": "sick", "timeIn": None, "timeOut": None}
     if re.search(r"^off$|^หยุด$", text, re.IGNORECASE):
         return {"status": "off", "timeIn": None, "timeOut": None}
     
-    # 2. ดึงเวลา HH:MM - HH:MM (ข้ามพวกข้อความต่อท้าย เช่น ot 0.11)
     range_match = re.search(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", text)
     if range_match:
-        return {
-            "status": "work", 
-            "timeIn": range_match.group(1), 
-            "timeOut": range_match.group(2)
-        }
+        return {"status": "work", "timeIn": range_match.group(1), "timeOut": range_match.group(2)}
         
     return {"status": "work", "timeIn": None, "timeOut": None}
 
@@ -108,14 +111,11 @@ def process_report_text(text, shifts):
 
     for line in lines:
         b_match = re.search(r"สาขา\s*([A-Za-zก-๙0-9_-]+)", line)
-        if b_match: 
-            branch = b_match.group(1).strip()
+        if b_match: branch = b_match.group(1).strip()
             
         d_match = re.search(r"วันที่\s*(\d{1,2}\/\d{1,2}\/\d{2,4})", line)
-        if d_match: 
-            ymd = parse_thai_date(d_match.group(1))
+        if d_match: ymd = parse_thai_date(d_match.group(1))
 
-        # ดักจับแพทเทิร์นรายการ (รองรับ Space หลายช่อง)
         r_match = re.search(r"^\d+[.)]\s*(\d{4,})\s+(\S+)\s+(.*)$", line)
         if r_match:
             code, name, rest = r_match.groups()
@@ -139,22 +139,18 @@ def webhook():
     signature = request.headers.get('X-Line-Signature')
     try:
         handler.handle(body, signature)
-    except Exception:
+    except Exception as e:
+        app.logger.error(f"Error signature: {e}")
         return 'Invalid signature', 400
     return 'OK', 200
 
-@handler.add(MessageEvent, message=TextMessage)
+@handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_text = event.message.text
-
-    # กรองเฉพาะข้อความที่มี สาขา และ วันที่
     if "สาขา" not in user_text or "วันที่" not in user_text:
         return
 
-    # ดึง DB Instance แบบ Lazy Load
     db = get_db()
-
-    # ดึงข้อมูล Master shifts จาก Firestore
     doc_ref = db.collection("ot_system").document("app_data")
     doc = doc_ref.get()
     if not doc.exists:
@@ -163,42 +159,51 @@ def handle_message(event):
     cloud_data = doc.to_dict()
     shifts = cloud_data.get("shifts", [])
 
-    # ประมวลผลข้อความ
     branch, ymd, rows = process_report_text(user_text, shifts)
 
-    if not branch or not ymd or not rows:
-        reply_msg = "❌ ไม่สามารถประมวลผลได้ กรุณาตรวจสอบรูปแบบข้อความ (ต้องมี สาขา, วันที่ และรายชื่อ)"
-        line_bot_api.reply_message(event.replyToken, TextSendMessage(text=reply_msg))
-        return
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
 
-    # เตรียม Data Structure สำหรับอัปเดตลง Firebase
-    record_key = f"{branch}|{ymd}"
-    next_records = cloud_data.get("records", {})
-    next_records[record_key] = rows
+        if not branch or not ymd or not rows:
+            reply_msg = "❌ ไม่สามารถประมวลผลได้ กรุณาตรวจสอบรูปแบบข้อความ"
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    replyToken=event.reply_token,
+                    messages=[TextMessage(text=reply_msg)]
+                )
+            )
+            return
 
-    next_emps = cloud_data.get("employees", {})
-    next_users = cloud_data.get("users", {})
+        record_key = f"{branch}|{ymd}"
+        next_records = cloud_data.get("records", {})
+        next_records[record_key] = rows
 
-    for r in rows:
-        next_emps[r['code']] = {"code": r['code'], "name": r['name']}
-        if r['code'] not in next_users:
-            next_users[r['code']] = {
-                "code": r['code'],
-                "pass": "1234",
-                "role": "employee",
-                "name": r['name']
-            }
+        next_emps = cloud_data.get("employees", {})
+        next_users = cloud_data.get("users", {})
 
-    # บันทึกขึ้น Firestore
-    doc_ref.update({
-        "records": next_records,
-        "employees": next_emps,
-        "users": next_users
-    })
+        for r in rows:
+            next_emps[r['code']] = {"code": r['code'], "name": r['name']}
+            if r['code'] not in next_users:
+                next_users[r['code']] = {
+                    "code": r['code'],
+                    "pass": "1234",
+                    "role": "employee",
+                    "name": r['name']
+                }
 
-    # ตอบกลับ LINE
-    reply_msg = f"✅ บันทึกข้อมูลเรียบร้อย!\nสาขา: {branch}\nวันที่: {ymd}\nจำนวน: {len(rows)} คน"
-    line_bot_api.reply_message(event.replyToken, TextSendMessage(text=reply_msg))
+        doc_ref.update({
+            "records": next_records,
+            "employees": next_emps,
+            "users": next_users
+        })
+
+        reply_msg = f"✅ บันทึกข้อมูลเรียบร้อย!\nสาขา: {branch}\nวันที่: {ymd}\nจำนวน: {len(rows)} คน"
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                replyToken=event.reply_token,
+                messages=[TextMessage(text=reply_msg)]
+            )
+        )
 
 if __name__ == "__main__":
     app.run(port=5000)
